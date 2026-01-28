@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 # 1. 設定區域 (Configuration)
 # ==========================================
 
-# 監控清單 (分為兩組以便報告)
+# 監控清單
 TARGETS_PRECIOUS = {
     "GC=F": "黃金期貨",
     "SI=F": "白銀期貨",
@@ -20,21 +20,16 @@ TARGETS_PRECIOUS = {
 TARGETS_INDUSTRIAL = {
     "HG=F": "銅期貨 (Dr.Copper)",
     "0358.HK": "江西銅業 (港)",
-    # "2009.TW": "第一銅" # 如果需要可自行加入
+    # "2009.TW": "第一銅" 
 }
 
-# 輔助指標
 TARGETS_INDEX = {
     "DX-Y.NYB": "美元指數"
 }
 
-# 合併所有 Ticker 用於下載
 ALL_TARGETS = {**TARGETS_PRECIOUS, **TARGETS_INDUSTRIAL, **TARGETS_INDEX}
 
-# 監控天數
 LOOKBACK_DAYS = 180
-
-# Discord Webhook
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # ==========================================
@@ -55,7 +50,6 @@ def get_market_data():
     tickers = list(ALL_TARGETS.keys())
     print(f"下載數據中... {tickers}")
     
-    # 下載並填補空值
     data = yf.download(tickers, start=start_date, progress=False)['Close']
     data = data.ffill()
     return data
@@ -78,12 +72,12 @@ def analyze_single_target(df, code):
         current_rsi = rsi_series.iloc[-1]
         
         # 狀態 Icon
-        if change_pct > 2.5: status_icon = "🔥" # 大漲
-        elif change_pct < -2.5: status_icon = "❄️" # 大跌
+        if change_pct > 2.5: status_icon = "🔥" 
+        elif change_pct < -2.5: status_icon = "❄️" 
         elif change_pct > 0: status_icon = "📈"
         else: status_icon = "📉"
         
-        # RSI 註解
+        # RSI 註解 (調整為更直觀的文字)
         rsi_note = ""
         if current_rsi > 75: rsi_note = "⚠️過熱"
         elif current_rsi > 55: rsi_note = "💪強勢"
@@ -106,41 +100,62 @@ def analyze_rotation_logic(df):
         gold = df['GC=F']
         copper = df['HG=F']
         
-        # 1. 30天相關係數 (Correlation)
-        # 如果相關係數降低，代表走勢脫鉤，可能是輪動開始
+        # 1. 30天相關係數
         correlation = gold.rolling(30).corr(copper).iloc[-1]
         
         # 2. 金銅比 (Gold / Copper Ratio)
-        # 金銅比下跌通常代表經濟復甦/通膨預期 (銅強於金)
         ratio = gold / copper
         current_ratio = ratio.iloc[-1]
-        prev_ratio = ratio.iloc[-20] # 一個月前
-        ratio_trend = "↘️下降(利好工業)" if current_ratio < prev_ratio else "↗️上升(避險主導)"
+        prev_ratio = ratio.iloc[-20]
         
-        # 3. 輪動訊號判斷
-        msg = ""
+        # 簡易判斷趨勢
+        if current_ratio < prev_ratio:
+            ratio_trend = "↘️下降 (資金流向工業)"
+        else:
+            ratio_trend = "↗️上升 (資金流向避險)"
+        
+        msg = f"⚖️ **金銅比**: `{current_ratio:.1f}` | 趨勢: {ratio_trend}\n"
+        msg += f"🔗 **相關性**: `{correlation:.2f}`"
+        
         if correlation < 0.3:
-            msg += "⚡ **注意：金銅走勢脫鉤 (相關性低)**，留意資金輪動。\n"
+            msg += " (⚠️脫鉤中，留意輪動)"
+        else:
+            msg += " (同步波動)"
         
-        msg += f"⚖️ **金銅比**: `{current_ratio:.1f}` ({ratio_trend})\n"
-        
+        msg += "\n"
         return msg
     except Exception as e:
         return f"無法計算輪動數據: {e}\n"
 
+def get_strategy_guide():
+    """
+    產生策略教學 (Cheat Sheet)
+    讓使用者在 Discord 中直接看到如何解讀數據
+    """
+    guide = """
+>>> **🧠 策略戰術板 (Cheat Sheet)**
+**1. 金銅比 (Gold/Copper Ratio) 怎麼看？**
+• 📉 **下降趨勢**: 銅強於金。代表景氣復甦或通膨預期，資金從避險(黃金)轉向製造(銅)，有利**資源股/工業金屬**。
+• 📈 **上升趨勢**: 金強於銅。代表市場恐慌或經濟衰退，資金躲回**黃金**。
+
+**2. 什麼是「脫鉤」與「輪動」？**
+• 當 **相關性 < 0.3** 且 **銅漲金跌** 時，驗證貼文說的「外溢效應」，是切入銅相關標的的好時機。
+
+**3. RSI 技術指標操作**
+• 🔥 **> 75 (過熱)**: 短線漲太多，容易回檔，**不要追高**，考慮分批停利。
+• ✨ **< 30 (超賣)**: 短線跌深，乖離過大，**尋找反彈買點**。
+"""
+    return guide
+
 def plot_chart(df):
-    """繪製 黃金 vs 銅 vs 庫存股"""
     plt.figure(figsize=(10, 6))
-    plt.style.use('bmh') # 使用乾淨的樣式
+    plt.style.use('bmh')
     
-    # 正規化 (以第一天為 100)
     norm_df = (df / df.iloc[0]) * 100
     
-    # 畫線
-    plt.plot(norm_df.index, norm_df['GC=F'], label='Gold (Safe)', color='#FFD700', linewidth=2)
-    plt.plot(norm_df.index, norm_df['HG=F'], label='Copper (Industrial)', color='#C15436', linewidth=2.5)
+    plt.plot(norm_df.index, norm_df['GC=F'], label='Gold', color='#FFD700', linewidth=2)
+    plt.plot(norm_df.index, norm_df['HG=F'], label='Copper', color='#C15436', linewidth=2.5)
     
-    # 如果有抓到江西銅業，也畫出來
     if '0358.HK' in norm_df.columns:
          plt.plot(norm_df.index, norm_df['0358.HK'], label='Jiangxi Copper (0358)', color='blue', alpha=0.6, linestyle='--')
 
@@ -159,8 +174,6 @@ def send_discord_notify(msg, img_path=None):
         print(msg)
         return
     
-    # Discord 限制 embed 內容長度，這裡用純文字簡單發送
-    # 如果要漂亮可以使用 Embed Object，但純文字+圖片最穩
     data = {"content": msg}
     files = {}
     
@@ -189,7 +202,7 @@ def main():
         # --- 組合訊息 ---
         msg = f"## 🛠️ 金屬板塊輪動追蹤 `{date_str}`\n"
         
-        # 1. 宏觀與輪動分析
+        # 1. 宏觀分析
         msg += "### 🌏 宏觀視野\n"
         msg += analyze_rotation_logic(df)
         dxy = analyze_single_target(df, 'DX-Y.NYB')
@@ -197,7 +210,7 @@ def main():
             msg += f"💵 **美元指數**: `{dxy['price']:.2f}` ({dxy['change']:+.2f}%) | {dxy['note']}\n"
         
         # 2. 貴金屬區塊
-        msg += "\n### 🥇 貴金屬 (避險/貨幣)\n"
+        msg += "\n### 🥇 貴金屬 (避險)\n"
         for code, name in TARGETS_PRECIOUS.items():
             res = analyze_single_target(df, code)
             if res:
@@ -210,8 +223,8 @@ def main():
             if res:
                 msg += f"> **{name}** `{res['price']:.2f}` {res['icon']} ({res['change']:+.2f}%) | RSI:{res['rsi']:.0f}\n"
         
-        # 策略提醒
-        msg += "\n💡 *觀點：若黃金盤整但銅價獨強，關注資源股補漲行情。*"
+        # 4. 加入策略教學 (Cheat Sheet) - 這裡呼叫新函式
+        msg += get_strategy_guide()
 
         # 產生圖表並發送
         img_path = plot_chart(df)
