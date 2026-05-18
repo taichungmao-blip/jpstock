@@ -33,4 +33,4 @@ jobs:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       run: |
         # 請確保這裡的檔名與你上傳到 GitHub 的 Python 檔名完全一致
-        python nikkei225_losers.py
+        python nikkei225_tracker_all.py
