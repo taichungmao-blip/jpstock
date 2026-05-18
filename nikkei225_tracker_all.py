@@ -12,7 +12,6 @@ from deep_translator import GoogleTranslator
 # ================= 設定區 =================
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# 日經 225 版塊中英對照表
 SECTOR_MAP = {
     'Technology': '科技',
     'Financials': '金融',
@@ -38,7 +37,6 @@ def get_nikkei225_tickers_info():
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         
-        # 嘗試一：解析表格 (若維基百科未來改回表格形式)
         try:
             tables = pd.read_html(io.StringIO(response.text))
             for df in tables:
@@ -48,18 +46,17 @@ def get_nikkei225_tickers_info():
         except Exception:
             pass
 
-        # 嘗試二：純文字解析 (對應目前維基百科改為條列清單的排版)
         info_dict = {}
-        clean_text = re.sub(r'<[^>]+>', '', response.text) # 移除 HTML 標籤
+        clean_text = re.sub(r'<[^>]+>', '', response.text) 
         matches = re.findall(r'([A-Za-z0-9\-\.\&\s]+?)\s*\(TYO:\s*(\d{4})\)', clean_text)
         
         for company, code in matches:
-            company = company.strip().split('\n')[-1] # 取乾淨的公司名稱
-            if len(company) > 30: company = company[:30] # 防呆機制
+            company = company.strip().split('\n')[-1] 
+            if len(company) > 30: company = company[:30] 
             symbol = f"{code}.T"
             info_dict[symbol] = {'Security': company, 'GICS Sector': 'Unknown'}
             
-        if len(info_dict) > 100: # 確保抓取到足夠的數量
+        if len(info_dict) > 100: 
             return info_dict
             
         return {}
@@ -68,10 +65,13 @@ def get_nikkei225_tickers_info():
         return {}
 
 def get_company_details(ticker, close_price):
-    """獲取簡介與精準股息率"""
+    """獲取簡介、精準股息率與公司名稱"""
     try:
         ticker_obj = yf.Ticker(ticker)
         info = ticker_obj.info
+        
+        # 取得公司名稱 (優先取短名，避免名稱過長)
+        company_name = info.get('shortName', info.get('longName', ticker))
         
         pe_ratio = info.get('trailingPE', info.get('forwardPE', 'N/A'))
         if isinstance(pe_ratio, (int, float)):
@@ -90,16 +90,17 @@ def get_company_details(ticker, close_price):
 
         summary_en = info.get('longBusinessSummary', '')
         if not summary_en:
-            return "暫無簡介", pe_ratio, div_yield_str
+            return "暫無簡介", pe_ratio, div_yield_str, company_name
         if len(summary_en) > 300:
             summary_en = summary_en[:300]
 
         translator = GoogleTranslator(source='auto', target='zh-TW')
         summary_zh = translator.translate(summary_en) + "..."
-        return summary_zh, pe_ratio, div_yield_str
+        
+        return summary_zh, pe_ratio, div_yield_str, company_name
     except Exception as e:
         print(f"資料獲取或翻譯失敗 ({ticker}): {e}")
-        return "無法獲取簡介", "N/A", "N/A"
+        return "無法獲取簡介", "N/A", "N/A", ticker
 
 def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary, pe_ratio, div_yield):
     company_name = info.get('Security', ticker)
@@ -139,9 +140,13 @@ def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
             
             close_price = stock_data['Close'].iloc[-1].item()
             
+            # 先取得公司詳細資訊，把公司名稱拿出來畫圖
+            summary, pe_ratio, div_yield, company_name = get_company_details(ticker, close_price)
+            
             plt.figure(figsize=(10, 5))
             plt.plot(stock_data.index, stock_data['Close'], color=line_color, linewidth=1.5)
-            plt.title(f"{ticker} - 1 Year Trend", fontsize=14)
+            # 在圖表標題加上公司名稱
+            plt.title(f"{ticker} {company_name} - 1 Year Trend", fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.5)
             plt.tight_layout()
             
@@ -149,8 +154,10 @@ def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
             plt.savefig(buf, format='png')
             plt.close()
             
-            summary, pe_ratio, div_yield = get_company_details(ticker, close_price)
             company_info = nikkei_info.get(ticker, {})
+            # 確保 Discord 文字標題也使用取得的正確名稱
+            company_info['Security'] = company_name 
+            
             send_to_discord(ticker, company_info, close_price, pct, buf, summary, pe_ratio, div_yield)
             time.sleep(2) 
         except Exception as e:
@@ -160,7 +167,6 @@ def main():
     nikkei_info = get_nikkei225_tickers_info()
     tickers = list(nikkei_info.keys())
     
-    # 若全部抓取失敗，提供涵蓋各大產業的 30 檔日本權值股作為備用
     if not tickers:
         print("警告：無法取得完整名單，啟用 30 檔大型權值股備用清單")
         tickers = [
@@ -179,14 +185,12 @@ def main():
 
     returns = data.pct_change().iloc[-1].dropna()
     
-    # 【關鍵修正】強制分離上漲與下跌的股票，避免互相混雜
     gainers = returns[returns > 0]
     losers = returns[returns < 0]
     
     top_10_gainers = gainers.nlargest(10)
     top_10_losers = losers.nsmallest(10)
     
-    # 發送通知
     process_and_send_list(top_10_gainers, "今日 日經 225 漲幅前十名個股報告", nikkei_info, '#1f77b4')
     process_and_send_list(top_10_losers, "今日 日經 225 跌幅最重個股報告", nikkei_info, 'green')
 
