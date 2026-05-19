@@ -4,7 +4,7 @@ name: Nikkei 225 Daily Tracker
 on:
   schedule:
     # 這裡使用 UTC 時間。UTC 07:30 = 台灣時間 15:30 (每週一到週五)
-    - cron: '30 7 * * 1-5'
+    - cron: '30 5 * * 1-5'
   # 加入 workflow_dispatch 讓你可以隨時在 GitHub 網頁上手動點選執行測試
   workflow_dispatch: 
 
