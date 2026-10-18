@@ -1,222 +1,113 @@
-import yfinance as yf
-import pandas as pd
-import matplotlib.pyplot as plt
-import requests
-import io
-import os
-import sys
-import time
-import re
-from deep_translator import GoogleTranslator
+        excess = len(message_content) - 1950
+        summary = summary[:max(0, len(summary) - excess - 1)] + '…'
+        message_content = (
+            f'{trend_emoji} **{ticker} - {company_name}**\n'
+            f'🏢 板塊: {sector_cn} ({sector_en})\n'
+            f'📊 本益比 (P/E): **{pe_ratio}** | 💰 股息率: **{div_yield}**\n'
+            f'📝 簡介: {summary}\n'
+            f'🔹 收盤價: ¥{close_price:.2f}\n'
+            f'{trend_emoji} {trend_text}: **{pct_change * 100:.2f}%**'
+        )
+    return send_webhook(message_content[:2000], image_buffer, ticker)
 
-# ================= 設定區 =================
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-SECTOR_MAP = {
-    'Technology': '科技',
-    'Financials': '金融',
-    'Consumer Goods': '消費品',
-    'Materials': '原物料',
-    'Capital Goods/Others': '資本財與其他',
-    'Transportation and Utilities': '運輸與公用事業',
-}
-
-if not WEBHOOK_URL:
-    print("錯誤：找不到 DISCORD_WEBHOOK_URL 環境變數！")
-    sys.exit(1)
-# ==========================================
-
-def get_nikkei225_tickers_info():
-    """從 Wikipedia 抓取日經 225 成分股清單與詳細資訊"""
-    print("正在獲取日經 225 成分股名單...")
-    url = 'https://en.wikipedia.org/wiki/Nikkei_225'
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        
-        try:
-            tables = pd.read_html(io.StringIO(response.text))
-            for df in tables:
-                if 'Company' in df.columns:
-                    # 兼容 Wikipedia 欄位名稱變動 (動態尋找 Code, Ticker 或 Symbol)
-                    code_col = next((col for col in ['Code', 'Ticker', 'Symbol'] if col in df.columns), None)
-                    
-                    if code_col and 'Sector' in df.columns:
-                        df['Symbol'] = df[code_col].astype(str) + '.T'
-                        return df.set_index('Symbol')[['Company', 'Sector']].rename(columns={'Company': 'Security', 'Sector': 'GICS Sector'}).to_dict(orient='index')
-        except Exception:
-            pass
-
-        info_dict = {}
-        clean_text = re.sub(r'<[^>]+>', '', response.text) 
-        matches = re.findall(r'([A-Za-z0-9\-\.\&\s]+?)\s*\(TYO:\s*(\d{4})\)', clean_text)
-        
-        for company, code in matches:
-            company = company.strip().split('\n')[-1] 
-            if len(company) > 30: company = company[:30] 
-            symbol = f"{code}.T"
-            info_dict[symbol] = {'Security': company, 'GICS Sector': 'Unknown'}
-            
-        if len(info_dict) > 100: 
-            return info_dict
-            
-        return {}
-    except Exception as e:
-        print(f"無法抓取 Wiki 資料: {e}")
-        return {}
-
-def get_company_details(ticker, close_price):
-    """獲取簡介、精準股息率、公司名稱與所屬板塊"""
-    try:
-        if isinstance(ticker, tuple):
-            ticker = ticker[0]
-            
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        })
-        
-        ticker_obj = yf.Ticker(ticker, session=session)
-        info = ticker_obj.info
-        
-        company_name = info.get('shortName', info.get('longName', ticker))
-        
-        # 直接從 yfinance 取得板塊資訊，取代不穩定的維基百科
-        sector_en = info.get('sector', 'Unknown')
-        
-        pe_ratio = info.get('trailingPE', info.get('forwardPE', 'N/A'))
-        if isinstance(pe_ratio, (int, float)):
-            pe_ratio = f"{pe_ratio:.2f}"
-            
-        trailing_div_rate = info.get('trailingAnnualDividendRate')
-        if isinstance(trailing_div_rate, (int, float)) and close_price > 0:
-            div_yield = (trailing_div_rate / close_price) * 100
-            div_yield_str = f"{div_yield:.2f}%" if div_yield > 0 else "0.00%"
+def extract_close(data, ticker=None):
+    """相容 yfinance 單檔與多檔下載的 MultiIndex 欄位。"""
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+    if isinstance(data.columns, pd.MultiIndex):
+        if 'Close' in data.columns.get_level_values(0):
+            close = data['Close']
+        elif 'Close' in data.columns.get_level_values(1):
+            close = data.xs('Close', axis=1, level=1)
         else:
-            raw_yield = info.get('dividendYield')
-            if isinstance(raw_yield, (int, float)):
-                div_yield_str = f"{raw_yield:.2f}%" if raw_yield > 0.3 else f"{raw_yield * 100:.2f}%"
-            else:
-                div_yield_str = "N/A"
+            return pd.Series(dtype=float)
+        if isinstance(close, pd.DataFrame):
+            if ticker in close.columns:
+                close = close[ticker]
+            elif close.shape[1] == 1:
+                close = close.iloc[:, 0]
+        return close
+    return data['Close'] if 'Close' in data.columns else pd.Series(dtype=float)
 
-        summary_en = info.get('longBusinessSummary', '')
-        if not summary_en:
-            return "暫無簡介", pe_ratio, div_yield_str, company_name, sector_en
-        if len(summary_en) > 300:
-            summary_en = summary_en[:300]
 
-        # 加入延遲與重試機制，避免翻譯 API 阻擋
-        translator = GoogleTranslator(source='auto', target='zh-TW')
-        try:
-            summary_zh = translator.translate(summary_en) + "..."
-        except Exception:
-            time.sleep(2) # 延遲 2 秒後重試
-            try:
-                summary_zh = translator.translate(summary_en) + "..."
-            except Exception as e:
-                print(f"翻譯重試失敗: {e}")
-                summary_zh = summary_en[:100] + "...(翻譯服務暫時無法使用)"
-        
-        return summary_zh, pe_ratio, div_yield_str, company_name, sector_en
-    except Exception as e:
-        print(f"資料獲取失敗 ({ticker}): {e}")
-        return "無法獲取簡介", "N/A", "N/A", str(ticker), "Unknown"
-        
-def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary, pe_ratio, div_yield, sector_en):
-    company_name = info.get('Security', ticker)
-    
-    # 擴充部分 yfinance 常見的英文板塊對應
-    sector_cn = SECTOR_MAP.get(sector_en, sector_en)
-    
-    trend_emoji = "📈" if pct_change > 0 else "📉"
-    trend_text = "漲幅" if pct_change > 0 else "跌幅"
-    
-    message_content = (
-        f"{trend_emoji} **{ticker} - {company_name}**\n"
-        f"🏢 版塊: {sector_cn} ({sector_en})\n"
-        f"📊 本益比 (P/E): **{pe_ratio}** |  💰 股息率: **{div_yield}**\n"
-        f"📝 簡介: {summary}\n"
-        f"🔹 收盤價: ¥{close_price:.2f}\n"
-        f"{trend_emoji} {trend_text}: **{pct_change * 100:.2f}%**" 
-    )
-    
-    payload = {"content": message_content}
-    image_buffer.seek(0)
-    files = {"file": (f"{ticker}_1Y.png", image_buffer, "image/png")}
-    requests.post(WEBHOOK_URL, data=payload, files=files)
-    
-def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
+def process_and_send_list(stock_series, title_msg, nikkei_info, line_color, cache, has_chinese_font):
     if stock_series.empty:
-        print(f"{title_msg} 無符合資料")
+        print(f'{title_msg}：無符合資料')
         return
-        
-    print(f"\n--- {title_msg} ---")
-    requests.post(WEBHOOK_URL, json={"content": f"📊 **{title_msg}** 📊"})
+    print(f'\n--- {title_msg} ---')
+    send_webhook(f'📊 **{title_msg}** 📊')
     time.sleep(1)
-    
     for rank, (ticker, pct) in enumerate(stock_series.items(), start=1):
+        print(f'處理第 {rank} 名：{ticker}')
         try:
-            stock_data = yf.download(ticker, period="9mo", progress=False)
-            if stock_data.empty: continue
-            
-            close_price = stock_data['Close'].iloc[-1].item()
-            
-            # 接收新增的 sector_en
-            summary, pe_ratio, div_yield, company_name, sector_en = get_company_details(ticker, close_price)
-            
-            plt.figure(figsize=(10, 5))
-            plt.plot(stock_data.index, stock_data['Close'], color=line_color, linewidth=1.5)
-            plt.title(f"{ticker} {company_name} - 1 Year Trend", fontsize=14)
-            plt.grid(True, linestyle='--', alpha=0.5)
-            plt.tight_layout()
-            
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            plt.close()
-            
-            company_info = nikkei_info.get(ticker, {})
-            company_info['Security'] = company_name 
-            
-            # 將 sector_en 傳遞給 Discord 發送函式
-            send_to_discord(ticker, company_info, close_price, pct, buf, summary, pe_ratio, div_yield, sector_en)
-            
-            # 增加迴圈間隔至 3 秒，進一步降低被 Yahoo API 與 Google 翻譯阻擋的機率
-            time.sleep(3) 
-        except Exception as e:
-            print(f"處理 {ticker} 時發生錯誤: {e}")
+            stock_data = yf.download(ticker, period='1y', progress=False, auto_adjust=True, threads=False)
+            close = extract_close(stock_data, ticker)
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = pd.to_numeric(close, errors='coerce').dropna()
+            if close.empty:
+                print(f'{ticker} 無股價資料，略過')
+                continue
+            close_price = float(close.iloc[-1])
+            summary, pe_ratio, div_yield, company_name, sector_en = get_company_details(ticker, close_price, cache)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            try:
+                ax.plot(close.index, close.values, color=line_color, linewidth=1.5)
+                title_suffix = '近一年股價走勢' if has_chinese_font else '1 Year Trend'
+                ax.set_title(f'{ticker} {company_name} - {title_suffix}', fontsize=14)
+                ax.grid(True, linestyle='--', alpha=0.5)
+                fig.tight_layout()
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=120)
+            finally:
+                plt.close(fig)
+            company_info = dict(nikkei_info.get(ticker, {}))
+            company_info['Security'] = company_name
+            if send_to_discord(ticker, company_info, close_price, float(pct), buf,
+                               summary, pe_ratio, div_yield, sector_en):
+                print(f'  {ticker} 已送出 Discord')
+            time.sleep(3)
+        except Exception as exc:
+            print(f'處理 {ticker} 時發生錯誤：{exc}')
+
+
 def main():
+    if not WEBHOOK_URL:
+        print('錯誤：找不到 DISCORD_WEBHOOK_URL 環境變數！')
+        return 1
+    cache = load_cache()
+    has_chinese_font = configure_chinese_font()
     nikkei_info = get_nikkei225_tickers_info()
-    tickers = list(nikkei_info.keys())
-    
+    tickers = list(nikkei_info)
     if not tickers:
-        print("警告：無法取得完整名單，啟用 30 檔大型權值股備用清單")
-        tickers = [
-            '9983.T', '8035.T', '6857.T', '9984.T', '9433.T', '4063.T', '6367.T', '6954.T', 
-            '4543.T', '7267.T', '7203.T', '6758.T', '7974.T', '6098.T', '8001.T', '6501.T', 
-            '8306.T', '8031.T', '6861.T', '6902.T', '6273.T', '4502.T', '4568.T', '7741.T', 
-            '4661.T', '6981.T', '6594.T', '3382.T', '6752.T', '7201.T'
-        ]
+        print('警告：無法取得完整名單，啟用原本的 30 檔大型權值股備用清單')
+        tickers = FALLBACK_TICKERS
         nikkei_info = {t: {'Security': t, 'GICS Sector': 'Unknown'} for t in tickers}
-    
-    print("正在下載股價資料...")
-    data = yf.download(tickers, period="5d", progress=False)['Close']
-    
-    if data.empty:
-        return
+    print('正在下載股價資料...')
+    try:
+        data = yf.download(tickers, period='5d', progress=False, auto_adjust=True, threads=True)
+        close = extract_close(data)
+        if isinstance(close, pd.Series):
+            close = close.to_frame(name=tickers[0])
+        if close.empty or len(close) < 2:
+            print('股價資料不足，無法計算日漲跌幅')
+            return 1
+        # 取每檔股票最近兩筆有效收盤價，避免休市或個別股票缺值造成遺漏。
+        returns = close.apply(lambda s: pd.to_numeric(s, errors='coerce').dropna().pct_change().iloc[-1]
+                              if pd.to_numeric(s, errors='coerce').notna().sum() >= 2 else float('nan'))
+        returns = returns.dropna()
+        gainers = returns[returns > 0].nlargest(10)
+        losers = returns[returns < 0].nsmallest(10)
+        process_and_send_list(gainers, '今日 日經 225 漲幅前十名個股報告',
+                              nikkei_info, '#1f77b4', cache, has_chinese_font)
+        process_and_send_list(losers, '今日 日經 225 跌幅最重個股報告',
+                              nikkei_info, 'green', cache, has_chinese_font)
+        return 0
+    except Exception as exc:
+        print(f'下載或分析股價時發生錯誤：{exc}')
+        return 1
 
-    returns = data.pct_change().iloc[-1].dropna()
-    
-    gainers = returns[returns > 0]
-    losers = returns[returns < 0]
-    
-    top_10_gainers = gainers.nlargest(10)
-    top_10_losers = losers.nsmallest(10)
-    
-    process_and_send_list(top_10_gainers, "今日 日經 225 漲幅前十名個股報告", nikkei_info, '#1f77b4')
-    process_and_send_list(top_10_losers, "今日 日經 225 跌幅最重個股報告", nikkei_info, 'green')
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
