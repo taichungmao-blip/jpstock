@@ -18,6 +18,7 @@ from deep_translator import GoogleTranslator
 
 WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
 CACHE_FILE = Path(os.getenv('TRANSLATION_CACHE_FILE', str(Path(__file__).with_name('nikkei_translation_cache.json'))))
+CONSTITUENTS_CACHE_FILE = Path(os.getenv('NIKKEI_CONSTITUENTS_CACHE_FILE', str(Path(__file__).with_name('nikkei225_constituents_cache.json'))))
 HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; Nikkei225Tracker/1.0)'}
 SECTOR_MAP = {
     'Technology': '科技', 'Financials': '金融', 'Financial Services': '金融服務',
@@ -116,47 +117,105 @@ def configure_chinese_font():
 
 
 def normalize_code(value):
-    match = re.search(r'(?<!\d)(\d{4})(?!\d)', str(value))
+    """將 7203、7203.0、7203.T 等形式統一成 7203.T。"""
+    if pd.isna(value):
+        return None
+    raw = str(value).strip().upper()
+    match = re.fullmatch(r'(\d{4})(?:\.0+)?(?:\.T)?', raw)
     return f'{match.group(1)}.T' if match else None
 
 
+def flatten_column(column):
+    """支援 Wikipedia 可能出現的多層表頭。"""
+    if isinstance(column, tuple):
+        pieces = [str(v).strip() for v in column if str(v).strip().lower() not in ('nan', 'unnamed')
+                  and not str(v).lower().startswith('unnamed:')]
+        return ' '.join(pieces).lower()
+    return str(column).strip().lower()
+
+
+def find_column(columns, names):
+    for name in names:
+        for col in columns:
+            normalized = flatten_column(col)
+            if normalized == name or normalized.endswith(' ' + name):
+                return col
+    return None
+
+
+def parse_constituents_table(df):
+    """解析單張表格；不將年份、註解或其他數字誤認為股票代碼。"""
+    code_col = find_column(df.columns, ('code', 'ticker', 'ticker symbol', 'stock code', 'security code', 'symbol'))
+    name_col = find_column(df.columns, ('company', 'company name', 'name', 'security', 'constituent'))
+    sector_col = find_column(df.columns, ('sector', 'industry', 'gics sector'))
+    if code_col is None or name_col is None:
+        return {}
+    result = {}
+    for _, row in df.iterrows():
+        ticker = normalize_code(row[code_col])
+        name = str(row[name_col]).strip()
+        if not ticker or not name or name.lower() in ('nan', 'none', '-'):
+            continue
+        sector = str(row[sector_col]).strip() if sector_col is not None else 'Unknown'
+        if not sector or sector.lower() == 'nan':
+            sector = 'Unknown'
+        result[ticker] = {'Security': name, 'GICS Sector': sector}
+    return result
+
+
+def read_constituents_cache():
+    try:
+        with CONSTITUENTS_CACHE_FILE.open('r', encoding='utf-8') as file:
+            cached = json.load(file)
+        if isinstance(cached, dict):
+            valid = {symbol: entry for symbol, entry in cached.items()
+                     if normalize_code(symbol) == symbol and isinstance(entry, dict)
+                     and isinstance(entry.get('Security'), str)}
+            if 200 <= len(valid) <= 230:
+                print(f'使用上次成功保存的日經成分股名單（{len(valid)} 檔；可能不是最新名單）')
+                return valid
+    except (OSError, ValueError, TypeError) as exc:
+        print(f'成分股快取不可用：{exc}')
+    return {}
+
+
+def save_constituents_cache(constituents):
+    try:
+        CONSTITUENTS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CONSTITUENTS_CACHE_FILE.with_name(CONSTITUENTS_CACHE_FILE.name + '.tmp')
+        with temporary.open('w', encoding='utf-8') as file:
+            json.dump(constituents, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, CONSTITUENTS_CACHE_FILE)
+    except OSError as exc:
+        print(f'成分股快取儲存失敗：{exc}')
+
+
 def get_nikkei225_tickers_info():
+    """取得 Wikipedia 日經 225 名單，驗證數量並備援到上次成功的快取。"""
     print('正在獲取日經 225 成分股名單...')
     url = 'https://en.wikipedia.org/wiki/Nikkei_225'
     try:
-        response = requests.get(url, headers=HEADERS, timeout=25)
+        response = requests.get(url, headers=HEADERS, timeout=(10, 30))
         response.raise_for_status()
-        for df in pd.read_html(io.StringIO(response.text)):
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [str(c[-1]) for c in df.columns.to_flat_index()]
-            cols = {str(c).strip().lower(): c for c in df.columns}
-            code_col = next((cols[k] for k in ('code', 'ticker', 'symbol') if k in cols), None)
-            name_col = next((cols[k] for k in ('company', 'company name', 'name') if k in cols), None)
-            sector_col = next((cols[k] for k in ('sector', 'industry') if k in cols), None)
-            if code_col is None or name_col is None:
-                continue
-            result = {}
-            for _, row in df.iterrows():
-                symbol = normalize_code(row[code_col])
-                if symbol:
-                    result[symbol] = {
-                        'Security': str(row[name_col]).strip(),
-                        'GICS Sector': str(row[sector_col]).strip() if sector_col is not None else 'Unknown',
-                    }
-            if len(result) >= 150:
-                print(f'已取得 {len(result)} 檔成分股')
-                return result
-        # 舊版 Wikipedia 文字備援
-        clean_text = re.sub(r'<[^>]+>', ' ', response.text)
-        matches = re.findall(r'([A-Za-z0-9\-.&\s]+?)\s*\(TYO:\s*(\d{4})\)', clean_text)
-        result = {f'{code}.T': {'Security': company.strip()[-60:], 'GICS Sector': 'Unknown'}
-                  for company, code in matches}
-        if len(result) >= 150:
-            return result
-        print('維基百科成分股表格無法完整辨識。')
+        tables = pd.read_html(io.StringIO(response.text))
+        candidates = [parse_constituents_table(df) for df in tables]
+        candidates = [candidate for candidate in candidates if candidate]
+        # 成分股應接近 225 檔。避免錯抓 Wikipedia 其他歷史紀錄或比較表。
+        valid = [candidate for candidate in candidates if 200 <= len(candidate) <= 230]
+        if valid:
+            best = min(valid, key=lambda candidate: abs(len(candidate) - 225))
+            print(f'Wikipedia 已取得 {len(best)} 檔成分股')
+            if len(best) != 225:
+                print('提醒：成分股數量不是 225，請確認 Wikipedia 當前資料。')
+            save_constituents_cache(best)
+            return best
+        counts = [len(c) for c in candidates]
+        print(f'Wikipedia 未找到可信的完整成分股表格（候選筆數：{counts}）。')
+    except (requests.RequestException, ValueError, ImportError, TypeError) as exc:
+        print(f'無法解析 Wikipedia 成分股資料：{exc}')
     except Exception as exc:
-        print(f'無法抓取維基百科資料：{exc}')
-    return {}
+        print(f'Wikipedia 資料發生未預期錯誤：{exc}')
+    return read_constituents_cache()
 
 
 def format_pe(value):
@@ -329,7 +388,7 @@ def main():
     nikkei_info = get_nikkei225_tickers_info()
     tickers = list(nikkei_info)
     if not tickers:
-        print('警告：無法取得完整名單，啟用原本的 30 檔大型權值股備用清單')
+        print('警告：無法取得完整名單或成分股快取，啟用原本的 30 檔大型權值股備用清單；此時排行不是完整日經 225 排行')
         tickers = FALLBACK_TICKERS
         nikkei_info = {t: {'Security': t, 'GICS Sector': 'Unknown'} for t in tickers}
     print('正在下載股價資料...')
@@ -359,3 +418,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
