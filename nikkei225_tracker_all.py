@@ -1,3 +1,251 @@
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+import pandas as pd
+import requests
+import yfinance as yf
+from deep_translator import GoogleTranslator
+
+WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
+CACHE_FILE = Path(os.getenv('TRANSLATION_CACHE_FILE', str(Path(__file__).with_name('nikkei_translation_cache.json'))))
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; Nikkei225Tracker/1.0)'}
+SECTOR_MAP = {
+    'Technology': '科技', 'Financials': '金融', 'Financial Services': '金融服務',
+    'Industrials': '工業', 'Healthcare': '醫療保健', 'Basic Materials': '基礎原物料',
+    'Materials': '原物料', 'Consumer Cyclical': '非必需消費品',
+    'Consumer Defensive': '民生必需消費品', 'Consumer Goods': '消費品',
+    'Communication Services': '通訊服務', 'Energy': '能源',
+    'Utilities': '公用事業', 'Real Estate': '房地產',
+    'Capital Goods/Others': '資本財與其他',
+    'Transportation and Utilities': '運輸與公用事業',
+    'Unknown': '未知產業',
+}
+FALLBACK_TICKERS = [
+    '9983.T', '8035.T', '6857.T', '9984.T', '9433.T', '4063.T', '6367.T', '6954.T',
+    '4543.T', '7267.T', '7203.T', '6758.T', '7974.T', '6098.T', '8001.T', '6501.T',
+    '8306.T', '8031.T', '6861.T', '6902.T', '6273.T', '4502.T', '4568.T', '7741.T',
+    '4661.T', '6981.T', '6594.T', '3382.T', '6752.T', '7201.T',
+]
+
+
+def load_cache():
+    try:
+        if CACHE_FILE.is_file():
+            with CACHE_FILE.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError) as exc:
+        print(f'翻譯快取讀取失敗，將重新建立：{exc}')
+    return {}
+
+
+def save_cache(cache):
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = CACHE_FILE.with_name(CACHE_FILE.name + '.tmp')
+        with temp_file.open('w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, CACHE_FILE)
+    except OSError as exc:
+        print(f'翻譯快取儲存失敗：{exc}')
+
+
+def translate_to_chinese(text, cache):
+    """只快取成功翻譯的內容；原文改變時重新翻譯。"""
+    if not text or not text.strip():
+        return '暫無公司簡介'
+    text = text.strip()
+    key = hashlib.sha256(('en>zh-TW:' + text).encode('utf-8')).hexdigest()
+    cached = cache.get(key)
+    if isinstance(cached, str) and cached.strip():
+        print('  使用既有中文翻譯快取')
+        return cached
+    for attempt in range(1, 4):
+        try:
+            result = GoogleTranslator(source='en', target='zh-TW').translate(text)
+            if result and result.strip() and result.strip() != text:
+                result = result.strip()
+                cache[key] = result
+                save_cache(cache)
+                return result
+            raise ValueError('翻譯結果為空或與英文原文相同')
+        except Exception as exc:
+            print(f'  翻譯第 {attempt}/3 次失敗：{exc}')
+            if attempt < 3:
+                time.sleep(3 * attempt)
+    return text + '（翻譯服務暫時無法使用）'
+
+
+def configure_chinese_font():
+    """優先使用使用者指定字型，再嘗試常見中日文字型。"""
+    specified = os.getenv('CHINESE_FONT_PATH', '').strip()
+    if specified:
+        try:
+            font_manager.fontManager.addfont(specified)
+            name = font_manager.FontProperties(fname=specified).get_name()
+            plt.rcParams['font.sans-serif'] = [name, 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+            print(f'圖表中文字型：{name}')
+            return True
+        except Exception as exc:
+            print(f'指定中文字型無法載入：{exc}')
+    candidates = [
+        'Noto Sans CJK TC', 'Noto Sans TC', 'Microsoft JhengHei',
+        'PingFang TC', 'Heiti TC', 'Source Han Sans TW',
+        'WenQuanYi Zen Hei', 'Arial Unicode MS', 'Noto Sans CJK JP',
+    ]
+    installed = {font.name for font in font_manager.fontManager.ttflist}
+    for name in candidates:
+        if name in installed:
+            plt.rcParams['font.sans-serif'] = [name, 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+            print(f'圖表中文字型：{name}')
+            return True
+    print('警告：未找到中文字型，圖表將使用英文標題以避免缺字。')
+    return False
+
+
+def normalize_code(value):
+    match = re.search(r'(?<!\d)(\d{4})(?!\d)', str(value))
+    return f'{match.group(1)}.T' if match else None
+
+
+def get_nikkei225_tickers_info():
+    print('正在獲取日經 225 成分股名單...')
+    url = 'https://en.wikipedia.org/wiki/Nikkei_225'
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=25)
+        response.raise_for_status()
+        for df in pd.read_html(io.StringIO(response.text)):
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [str(c[-1]) for c in df.columns.to_flat_index()]
+            cols = {str(c).strip().lower(): c for c in df.columns}
+            code_col = next((cols[k] for k in ('code', 'ticker', 'symbol') if k in cols), None)
+            name_col = next((cols[k] for k in ('company', 'company name', 'name') if k in cols), None)
+            sector_col = next((cols[k] for k in ('sector', 'industry') if k in cols), None)
+            if code_col is None or name_col is None:
+                continue
+            result = {}
+            for _, row in df.iterrows():
+                symbol = normalize_code(row[code_col])
+                if symbol:
+                    result[symbol] = {
+                        'Security': str(row[name_col]).strip(),
+                        'GICS Sector': str(row[sector_col]).strip() if sector_col is not None else 'Unknown',
+                    }
+            if len(result) >= 150:
+                print(f'已取得 {len(result)} 檔成分股')
+                return result
+        # 舊版 Wikipedia 文字備援
+        clean_text = re.sub(r'<[^>]+>', ' ', response.text)
+        matches = re.findall(r'([A-Za-z0-9\-.&\s]+?)\s*\(TYO:\s*(\d{4})\)', clean_text)
+        result = {f'{code}.T': {'Security': company.strip()[-60:], 'GICS Sector': 'Unknown'}
+                  for company, code in matches}
+        if len(result) >= 150:
+            return result
+        print('維基百科成分股表格無法完整辨識。')
+    except Exception as exc:
+        print(f'無法抓取維基百科資料：{exc}')
+    return {}
+
+
+def format_pe(value):
+    try:
+        return f'{float(value):.2f}' if value is not None else 'N/A'
+    except (TypeError, ValueError):
+        return 'N/A'
+
+
+def get_company_details(ticker, close_price, cache):
+    company_name, sector_en = str(ticker), 'Unknown'
+    try:
+        info = yf.Ticker(ticker).info or {}
+        company_name = info.get('shortName') or info.get('longName') or ticker
+        sector_en = info.get('sector') or 'Unknown'
+        pe_ratio = format_pe(info.get('trailingPE') if info.get('trailingPE') is not None else info.get('forwardPE'))
+        rate = info.get('trailingAnnualDividendRate')
+        if isinstance(rate, (int, float)) and close_price > 0:
+            div_yield = f'{max(0.0, rate / close_price * 100):.2f}%'
+        else:
+            raw = info.get('dividendYield')
+            if isinstance(raw, (int, float)):
+                # Yahoo Finance 版本的 dividendYield 可能是比例或百分比。
+                div_yield = f'{(raw * 100 if raw <= 0.3 else raw):.2f}%'
+            else:
+                div_yield = 'N/A'
+        summary_en = (info.get('longBusinessSummary') or '').strip()
+        if summary_en:
+            summary_en = summary_en[:300].rsplit(' ', 1)[0] if len(summary_en) > 300 else summary_en
+        summary = translate_to_chinese(summary_en, cache)
+        if len(summary_en) == 300 or (info.get('longBusinessSummary') or '').strip() != summary_en:
+            summary += '…'
+        return summary, pe_ratio, div_yield, company_name, sector_en
+    except Exception as exc:
+        print(f'資料獲取失敗 ({ticker})：{exc}')
+        return '無法獲取簡介', 'N/A', 'N/A', company_name, sector_en
+
+
+def send_webhook(content, image_buffer=None, ticker=None):
+    """處理 Discord 429 與短暫性 5xx 錯誤；避免靜默失敗。"""
+    for attempt in range(3):
+        try:
+            if image_buffer is None:
+                response = requests.post(WEBHOOK_URL, json={'content': content}, timeout=30)
+            else:
+                image_buffer.seek(0)
+                response = requests.post(
+                    WEBHOOK_URL, data={'content': content},
+                    files={'file': (f'{ticker}_trend.png', image_buffer, 'image/png')},
+                    timeout=45,
+                )
+            if response.status_code in (200, 204):
+                return True
+            if response.status_code == 429:
+                try:
+                    wait = float(response.json().get('retry_after', 3))
+                except (ValueError, TypeError):
+                    wait = 3
+                time.sleep(min(max(wait, 1), 60))
+                continue
+            if 500 <= response.status_code < 600:
+                time.sleep(3 * (attempt + 1))
+                continue
+            print(f'Discord 傳送失敗：HTTP {response.status_code} {response.text[:200]}')
+            return False
+        except requests.RequestException as exc:
+            print(f'Discord 連線失敗 ({attempt + 1}/3)：{exc}')
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    return False
+
+
+def send_to_discord(ticker, info, close_price, pct_change, image_buffer,
+                    summary, pe_ratio, div_yield, sector_en):
+    company_name = info.get('Security', ticker)
+    sector_en = sector_en or 'Unknown'
+    sector_cn = SECTOR_MAP.get(sector_en, sector_en)
+    trend_emoji = '📈' if pct_change > 0 else '📉'
+    trend_text = '漲幅' if pct_change > 0 else '跌幅'
+    message_content = (
+        f'{trend_emoji} **{ticker} - {company_name}**\n'
+        f'🏢 板塊: {sector_cn} ({sector_en})\n'
+        f'📊 本益比 (P/E): **{pe_ratio}** | 💰 股息率: **{div_yield}**\n'
+        f'📝 簡介: {summary}\n'
+        f'🔹 收盤價: ¥{close_price:.2f}\n'
+        f'{trend_emoji} {trend_text}: **{pct_change * 100:.2f}%**'
+    )
+    # Discord content 上限為 2000 字元，預留空間給其他欄位。
+    if len(message_content) > 1950:
         excess = len(message_content) - 1950
         summary = summary[:max(0, len(summary) - excess - 1)] + '…'
         message_content = (
