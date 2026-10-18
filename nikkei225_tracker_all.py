@@ -40,9 +40,13 @@ def get_nikkei225_tickers_info():
         try:
             tables = pd.read_html(io.StringIO(response.text))
             for df in tables:
-                if 'Code' in df.columns and 'Company' in df.columns:
-                    df['Symbol'] = df['Code'].astype(str) + '.T'
-                    return df.set_index('Symbol')[['Company', 'Sector']].rename(columns={'Company': 'Security', 'Sector': 'GICS Sector'}).to_dict(orient='index')
+                if 'Company' in df.columns:
+                    # 兼容 Wikipedia 欄位名稱變動 (動態尋找 Code, Ticker 或 Symbol)
+                    code_col = next((col for col in ['Code', 'Ticker', 'Symbol'] if col in df.columns), None)
+                    
+                    if code_col and 'Sector' in df.columns:
+                        df['Symbol'] = df[code_col].astype(str) + '.T'
+                        return df.set_index('Symbol')[['Company', 'Sector']].rename(columns={'Company': 'Security', 'Sector': 'GICS Sector'}).to_dict(orient='index')
         except Exception:
             pass
 
@@ -67,7 +71,17 @@ def get_nikkei225_tickers_info():
 def get_company_details(ticker, close_price):
     """獲取簡介、精準股息率與公司名稱"""
     try:
-        ticker_obj = yf.Ticker(ticker)
+        # 避免新版 yfinance 回傳 tuple 導致報錯
+        if isinstance(ticker, tuple):
+            ticker = ticker[0]
+            
+        # 加上 Session 與 Headers 防止被 Yahoo Finance 阻擋
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        })
+        
+        ticker_obj = yf.Ticker(ticker, session=session)
         info = ticker_obj.info
         
         # 取得公司名稱 (優先取短名，避免名稱過長)
@@ -94,13 +108,18 @@ def get_company_details(ticker, close_price):
         if len(summary_en) > 300:
             summary_en = summary_en[:300]
 
-        translator = GoogleTranslator(source='auto', target='zh-TW')
-        summary_zh = translator.translate(summary_en) + "..."
+        # 將翻譯包在獨立的 try-except 中，避免翻譯伺服器異常導致完全取不到資料
+        try:
+            translator = GoogleTranslator(source='auto', target='zh-TW')
+            summary_zh = translator.translate(summary_en) + "..."
+        except Exception as e:
+            print(f"翻譯失敗: {e}")
+            summary_zh = summary_en[:100] + "...(翻譯服務暫時無法使用)"
         
         return summary_zh, pe_ratio, div_yield_str, company_name
     except Exception as e:
-        print(f"資料獲取或翻譯失敗 ({ticker}): {e}")
-        return "無法獲取簡介", "N/A", "N/A", ticker
+        print(f"資料獲取失敗 ({ticker}): {e}")
+        return "無法獲取簡介", "N/A", "N/A", str(ticker)
 
 def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary, pe_ratio, div_yield):
     company_name = info.get('Security', ticker)
