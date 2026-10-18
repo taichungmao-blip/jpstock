@@ -69,13 +69,11 @@ def get_nikkei225_tickers_info():
         return {}
 
 def get_company_details(ticker, close_price):
-    """獲取簡介、精準股息率與公司名稱"""
+    """獲取簡介、精準股息率、公司名稱與所屬板塊"""
     try:
-        # 避免新版 yfinance 回傳 tuple 導致報錯
         if isinstance(ticker, tuple):
             ticker = ticker[0]
             
-        # 加上 Session 與 Headers 防止被 Yahoo Finance 阻擋
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -84,8 +82,10 @@ def get_company_details(ticker, close_price):
         ticker_obj = yf.Ticker(ticker, session=session)
         info = ticker_obj.info
         
-        # 取得公司名稱 (優先取短名，避免名稱過長)
         company_name = info.get('shortName', info.get('longName', ticker))
+        
+        # 直接從 yfinance 取得板塊資訊，取代不穩定的維基百科
+        sector_en = info.get('sector', 'Unknown')
         
         pe_ratio = info.get('trailingPE', info.get('forwardPE', 'N/A'))
         if isinstance(pe_ratio, (int, float)):
@@ -104,26 +104,31 @@ def get_company_details(ticker, close_price):
 
         summary_en = info.get('longBusinessSummary', '')
         if not summary_en:
-            return "暫無簡介", pe_ratio, div_yield_str, company_name
+            return "暫無簡介", pe_ratio, div_yield_str, company_name, sector_en
         if len(summary_en) > 300:
             summary_en = summary_en[:300]
 
-        # 將翻譯包在獨立的 try-except 中，避免翻譯伺服器異常導致完全取不到資料
+        # 加入延遲與重試機制，避免翻譯 API 阻擋
+        translator = GoogleTranslator(source='auto', target='zh-TW')
         try:
-            translator = GoogleTranslator(source='auto', target='zh-TW')
             summary_zh = translator.translate(summary_en) + "..."
-        except Exception as e:
-            print(f"翻譯失敗: {e}")
-            summary_zh = summary_en[:100] + "...(翻譯服務暫時無法使用)"
+        except Exception:
+            time.sleep(2) # 延遲 2 秒後重試
+            try:
+                summary_zh = translator.translate(summary_en) + "..."
+            except Exception as e:
+                print(f"翻譯重試失敗: {e}")
+                summary_zh = summary_en[:100] + "...(翻譯服務暫時無法使用)"
         
-        return summary_zh, pe_ratio, div_yield_str, company_name
+        return summary_zh, pe_ratio, div_yield_str, company_name, sector_en
     except Exception as e:
         print(f"資料獲取失敗 ({ticker}): {e}")
-        return "無法獲取簡介", "N/A", "N/A", str(ticker)
-
-def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary, pe_ratio, div_yield):
+        return "無法獲取簡介", "N/A", "N/A", str(ticker), "Unknown"
+        
+def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary, pe_ratio, div_yield, sector_en):
     company_name = info.get('Security', ticker)
-    sector_en = info.get('GICS Sector', 'Unknown')
+    
+    # 擴充部分 yfinance 常見的英文板塊對應
     sector_cn = SECTOR_MAP.get(sector_en, sector_en)
     
     trend_emoji = "📈" if pct_change > 0 else "📉"
@@ -142,7 +147,7 @@ def send_to_discord(ticker, info, close_price, pct_change, image_buffer, summary
     image_buffer.seek(0)
     files = {"file": (f"{ticker}_1Y.png", image_buffer, "image/png")}
     requests.post(WEBHOOK_URL, data=payload, files=files)
-
+    
 def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
     if stock_series.empty:
         print(f"{title_msg} 無符合資料")
@@ -159,12 +164,11 @@ def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
             
             close_price = stock_data['Close'].iloc[-1].item()
             
-            # 先取得公司詳細資訊，把公司名稱拿出來畫圖
-            summary, pe_ratio, div_yield, company_name = get_company_details(ticker, close_price)
+            # 接收新增的 sector_en
+            summary, pe_ratio, div_yield, company_name, sector_en = get_company_details(ticker, close_price)
             
             plt.figure(figsize=(10, 5))
             plt.plot(stock_data.index, stock_data['Close'], color=line_color, linewidth=1.5)
-            # 在圖表標題加上公司名稱
             plt.title(f"{ticker} {company_name} - 1 Year Trend", fontsize=14)
             plt.grid(True, linestyle='--', alpha=0.5)
             plt.tight_layout()
@@ -174,14 +178,15 @@ def process_and_send_list(stock_series, title_msg, nikkei_info, line_color):
             plt.close()
             
             company_info = nikkei_info.get(ticker, {})
-            # 確保 Discord 文字標題也使用取得的正確名稱
             company_info['Security'] = company_name 
             
-            send_to_discord(ticker, company_info, close_price, pct, buf, summary, pe_ratio, div_yield)
-            time.sleep(2) 
+            # 將 sector_en 傳遞給 Discord 發送函式
+            send_to_discord(ticker, company_info, close_price, pct, buf, summary, pe_ratio, div_yield, sector_en)
+            
+            # 增加迴圈間隔至 3 秒，進一步降低被 Yahoo API 與 Google 翻譯阻擋的機率
+            time.sleep(3) 
         except Exception as e:
             print(f"處理 {ticker} 時發生錯誤: {e}")
-
 def main():
     nikkei_info = get_nikkei225_tickers_info()
     tickers = list(nikkei_info.keys())
